@@ -1,14 +1,17 @@
 import os
 import time
+import asyncio
 import requests
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import ccxt
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 load_dotenv('config.env')
 
-SYMBOL = os.getenv('SYMBOL', 'BTC/USDT')
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
 TIMEFRAME = os.getenv('TIMEFRAME', '1h')
 RSI_OVERSOLD = int(os.getenv('RSI_OVERSOLD', 30))
 RSI_OVERBOUGHT = int(os.getenv('RSI_OVERBOUGHT', 70))
@@ -16,18 +19,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 exchange = ccxt.binance()
-last_signal = None
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+last_signals = {s: None for s in SYMBOLS}
 
 def calculate_rsi(prices, period=14):
     deltas = prices.diff()
@@ -39,43 +31,79 @@ def calculate_rsi(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def get_signal():
-    global last_signal
-    try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['rsi'] = calculate_rsi(df['close'])
-        
-        current_price = df['close'].iloc[-1]
-        current_rsi = df['rsi'].iloc[-1]
-        
-        signal = None
-        if last_signal != 'BUY' and current_rsi < RSI_OVERSOLD:
-            signal = 'BUY'
-        elif last_signal != 'SELL' and current_rsi > RSI_OVERBOUGHT:
-            signal = 'SELL'
-        
-        if signal:
-            last_signal = signal
-            return signal, current_price, current_rsi
-        return None, current_price, current_rsi
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, None, None
+def get_prices():
+    result = []
+    for symbol in SYMBOLS:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['rsi'] = calculate_rsi(df['close'])
+            price = df['close'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            result.append((symbol, price, rsi))
+        except Exception as e:
+            result.append((symbol, None, None))
+    return result
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Crypto RSI Bot\n\n"
+        "Commands:\n"
+        "/start - Start\n"
+        "/prices - Current prices & RSI\n"
+        "/status - Bot status\n"
+        "/help - Help"
+    )
+
+async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = get_prices()
+    msg = "Prices & RSI:\n\n"
+    for symbol, price, rsi in data:
+        if price:
+            msg += f"{symbol}: ${price:,.2f} | RSI: {rsi:.2f}\n"
+        else:
+            msg += f"{symbol}: Error\n"
+    await update.message.reply_text(msg)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = get_prices()
+    msg = "Status:\n\n"
+    for symbol, price, rsi in data:
+        if rsi:
+            zone = "OVERSOLD" if rsi < RSI_OVERSOLD else "OVERBOUGHT" if rsi > RSI_OVERBOUGHT else "NEUTRAL"
+            msg += f"{symbol}: {zone} (RSI: {rsi:.2f})\n"
+        else:
+            msg += f"{symbol}: Error\n"
+    msg += f"\nParams: Oversold={RSI_OVERSOLD}, Overbought={RSI_OVERBOUGHT}"
+    await update.message.reply_text(msg)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Crypto RSI Bot\n\n"
+        "Strategy: RSI\n"
+        "BUY: RSI < 30 (oversold)\n"
+        "SELL: RSI > 70 (overbought)\n\n"
+        "/prices - Check prices\n"
+        "/status - Check signals\n"
+        "/help - This help"
+    )
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command. Use /help")
 
 def main():
-    print(f"Trading bot started: {SYMBOL} | {TIMEFRAME}")
-    print(f"RSI params: Oversold={RSI_OVERSOLD}, Overbought={RSI_OVERBOUGHT}")
+    print(f"Starting bot for: {', '.join(SYMBOLS)}")
     
-    while True:
-        signal, price, rsi = get_signal()
-        if signal:
-            msg = f"📢 Сигнал: {signal}\nПара: {SYMBOL}\nЦіна: ${price:,.2f}\nRSI: {rsi:.2f}"
-            print(msg)
-            send_telegram(msg)
-        else:
-            print(f"Ціна: ${price:,.2f} | RSI: {rsi:.2f}")
-        time.sleep(3600)
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("prices", prices_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    
+    print("Bot ready!")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
